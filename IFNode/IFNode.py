@@ -5,7 +5,8 @@ import copy
 import triton
 import triton.language as tl
 import spikingjelly.activation_based.surrogate as surrogate
-
+import cmath
+import math
 
 def if_requries_grad(items):
     for item in items:
@@ -29,15 +30,15 @@ def preforward(py_dict):
     numel = py_dict['x_seq'].numel()
     N = py_dict['x_seq'].shape[1]
 
-    threads = 4096  
-    BLOCK_SIZE = 4096 
-    blocks = (N + threads - 1) // threads // BLOCK_SIZE
-    
-    grid = (blocks,threads,)
+    # if py_dict['x_seq'].dtype == torch.float16:
+        # N = math.ceil(N / 2)
+        # numel = N * py_dict['x_seq'].shape[0]
+
+    grid = lambda META: (triton.cdiv(N, META['BLOCK_SIZE']), )
+    # py_dict['BLOCK_SIZE'] = 512
     py_dict['numel'] = numel
     py_dict['N'] = N
     py_dict['T'] = py_dict['x_seq'].shape[0]
-    py_dict['BLOCK_SIZE'] = BLOCK_SIZE
 
     return requires_grad, grid, py_dict
 
@@ -49,7 +50,7 @@ def prebackward(ctx, grad_spike_seq: torch.Tensor, grad_v_seq: torch.Tensor):
     h_seq = ctx.h_seq
     N = ctx.N
     T = ctx.T
-    BLOCK_SIZE = ctx.BLOCK_SIZE
+    # BLOCK_SIZE = ctx.BLOCK_SIZE
     v_th = ctx.v_th
     v_reset = ctx.v_reset
 
@@ -70,7 +71,7 @@ def prebackward(ctx, grad_spike_seq: torch.Tensor, grad_v_seq: torch.Tensor):
         'numel': numel,
         'N': N,
         'T': T,
-        'BLOCK_SIZE': BLOCK_SIZE
+        # 'BLOCK_SIZE': BLOCK_SIZE,
     }
     return backward_kernel, grid, py_dict
 
@@ -106,17 +107,18 @@ class IFNodeATGF(torch.autograd.Function):
             py_dict['numel'],
             py_dict['N'],
             py_dict['T'],
-            BLOCK_SIZE=py_dict['BLOCK_SIZE']
+            # py_dict['BLOCK_SIZE'],
          )
         
         if 'v_reset' not in py_dict:
             py_dict['v_reset'] = None
 
         ctx_save(ctx, requires_grad, h_seq=py_dict['h_seq'], grid=grid, 
-                            BLOCK_SIZE=py_dict['BLOCK_SIZE'], numel=py_dict['numel'],
+                            numel=py_dict['numel'],
                             N=py_dict['N'], T=py_dict['T'],
                             v_th=py_dict['v_th'], v_reset=py_dict['v_reset'],
                             backward_kernel=backward_kernel)
+        
         return py_dict['spike_seq'], py_dict['v_v_seq'][1:,]
     
     @staticmethod
@@ -138,14 +140,27 @@ class IFNodeATGF(torch.autograd.Function):
             py_dict['numel'],
             py_dict['N'],
             py_dict['T'],
-            BLOCK_SIZE=py_dict['BLOCK_SIZE']
+            # py_dict['BLOCK_SIZE'],
         )
-
         if 'v_reset' not in py_dict:
             py_dict['v_reset'] = None
         
         return py_dict['grad_x_seq'], py_dict['grad_v_init'], None, None, None, None
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 4096 * 8}, num_warps=32, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 4096 * 4}, num_warps=32, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 4096 * 2}, num_warps=16, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=16, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 512},  num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 256},  num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 128},  num_warps=2, num_stages=2),
+    ],
+    key=['N'],
+)
 @triton.jit
 def triton_multi_step_forward_hard_reset(
         x_seq_ptr , # [T, N]
@@ -156,32 +171,43 @@ def triton_multi_step_forward_hard_reset(
         v_reset, 
         numel,
         N: tl.constexpr,
-        T:tl.constexpr,
+        T: tl.constexpr,
         BLOCK_SIZE:tl.constexpr,
     ):
-    block = tl.program_id(axis=0)
-    thread = tl.program_id(axis=1)
-    pid = block * tl.num_programs(1) + thread
-    
+    pid = tl.program_id(0)
     offset_n = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     
-    # for block_idx in range(0, BLOCK_SIZE):
     for t in tl.static_range(0, T):
         offset = t * N + offset_n
 
         mask = offset < numel
         x_seq_t = tl.load(x_seq_ptr + offset, mask=mask)
         v_v_seq_t = tl.load(v_v_seq_ptr + offset, mask=mask)
-
+        
         h_seq_t = x_seq_t + v_v_seq_t
+        tl.store(h_seq_ptr + offset, h_seq_t)
+
         spike_seq_t = h_seq_t >= v_th
+        tl.store(spike_seq_ptr + offset, spike_seq_t)
 
         v_v_seq_t_plus_dt = h_seq_t * (1. - spike_seq_t) + v_reset * spike_seq_t
-        tl.store(h_seq_ptr + offset, h_seq_t, mask=mask)
-        tl.store(spike_seq_ptr + offset, spike_seq_t, mask=mask)
-        mask2 = offset < numel + N
-        tl.store(v_v_seq_ptr + offset + N, v_v_seq_t_plus_dt, mask=mask2)
-        
+        tl.store(v_v_seq_ptr + offset + N, v_v_seq_t_plus_dt)
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 4096 * 8}, num_warps=32, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 4096 * 4}, num_warps=32, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 4096 * 4}, num_warps=32, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 4096 * 2}, num_warps=16, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=16, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 512},  num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 256},  num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 128},  num_warps=2, num_stages=2),
+    ],
+    key=['N'],
+)    
 @triton.jit
 def triton_multi_step_backward_hard_reset(
     grad_spike_seq_ptr, # [T, N]
@@ -196,10 +222,7 @@ def triton_multi_step_backward_hard_reset(
     T: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    block = tl.program_id(axis=0)
-    thread = tl.program_id(axis=1)
-    pid = block * tl.num_programs(1) + thread
-
+    pid = tl.program_id(0)
     offset_n = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
 
     grad_h = tl.zeros((BLOCK_SIZE, ), dtype=tl.float32)
@@ -212,7 +235,7 @@ def triton_multi_step_backward_hard_reset(
 
         over_th = h_seq - v_th
         spike_seq = (over_th >= 0)
-        sigmoid_backward__sigmoid_ax = 1. / (1. + tl.math.exp(-4. * over_th))
+        sigmoid_backward__sigmoid_ax = 1. / (1. + tl.exp(-4. * over_th))
         grad_s_to_h = (1. - sigmoid_backward__sigmoid_ax) * sigmoid_backward__sigmoid_ax * 4.
         grad_v_to_h = 1. - spike_seq
         temp_var = v_reset - h_seq
@@ -227,13 +250,12 @@ def triton_multi_step_backward_hard_reset(
 
         grad_h_to_x = 1.
         grad_x_seq = grad_h * grad_h_to_x
-        tl.store(grad_x_seq_ptr + offset, grad_x_seq, mask=mask)
+        tl.store(grad_x_seq_ptr + offset, grad_x_seq)
     
     grad_h_next_to_v = 1.
     grad_v_init = grad_h * grad_h_next_to_v
     mask = offset_n < numel
-    tl.store(grad_v_init_ptr + offset_n, grad_v_init, mask=mask)
-
+    tl.store(grad_v_init_ptr + offset_n, grad_v_init)
     
 class IFNode(nn.Module):
     def __init__(self, v_th: float = 1., v_reset: float = 0., surrogate_function: Callable = surrogate.Sigmoid(), detach_reset: bool = False, step_mode = 'm',
@@ -300,42 +322,18 @@ def forward_backward(net: torch.nn.Module, x_seq: torch.Tensor):
 
 if __name__ == '__main__':
     N = 64
-    C = 32 * 32 * 32 
-    device = 'cuda:0'
+    C = 32 * 32 * 32
+    device = 'cuda:7'
 
     repeats = 16
 
     net_triton = IFNode()
-    net_torch = neuron.IFNode(backend='torch', step_mode='m')
     net_cupy = neuron.IFNode(backend='cupy', step_mode='m')
 
-    for T in [2, 4, 8, 16, 32, 64]:
+    for T in [2, 4, 8, 16, 32]:
         x_seq = torch.rand([T, N, C], device=device, requires_grad=True, dtype=torch.float32)
 
-        t_triton = cuda_utils.cal_fun_t(repeats, device, forward_backward, net_triton, x_seq)
-        t_torch = cuda_utils.cal_fun_t(repeats, device, forward_backward, net_torch, x_seq)
         t_cupy = cuda_utils.cal_fun_t(repeats, device, forward_backward, net_cupy, x_seq)
+        t_triton = cuda_utils.cal_fun_t(repeats, device, forward_backward, net_triton, x_seq)
 
-        # print(f'T={T},'.ljust(30), f't_torch / t_triton = {round(t_torch / t_triton, 2)}')
         print(f'T={T},'.ljust(30), f't_cupy / t_triton = {round(t_cupy / t_triton, 2)}')
-
-    # T = 8
-    # N = 64
-    # C = 32 * 32 * 32
-    # device = 'cuda:0'
-    # for T in [2, 4, 8, 16]:
-    #     x_seq = torch.rand([T, N, C], device=device, requires_grad=True)
-
-    #     net_triton = IFNode()
-    #     y_triton = net_triton(x_seq)
-    #     y_triton.sum().backward()
-    #     x_grad_triton = x_seq.grad.clone()
-    #     x_seq.grad.zero_()
-
-    #     net_torch = neuron.IFNode(backend='torch', step_mode='m')
-    #     y_torch = net_torch(x_seq)
-    #     y_torch.sum().backward()
-    #     x_grad_torch = x_seq.grad.clone()
-
-    #     print('max error of y_seq', max_error(y_triton, y_torch))
-    #     print('max error of x_seq.grad', max_error(x_grad_triton, x_grad_torch))
